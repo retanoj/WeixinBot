@@ -18,10 +18,12 @@ import logging
 from collections import defaultdict
 from urlparse import urlparse
 from lxml import html
+import handle_magic as hm
 
 # for media upload
 import mimetypes
 from requests_toolbelt.multipart.encoder import MultipartEncoder
+
 
 
 def catchKeyboardInterrupt(fn):
@@ -687,32 +689,34 @@ class WebWeixin(object):
 
     def handleMsg(self, r):
         for msg in r['AddMsgList']:
-            print '[*] 你有新的消息，请注意查收'
             logging.debug('[*] 你有新的消息，请注意查收')
 
-            if self.DEBUG:
-                fn = 'msg' + str(int(random.random() * 1000)) + '.json'
-                with open(fn, 'w') as f:
-                    f.write(json.dumps(msg))
-                print '[*] 该消息已储存到文件: ' + fn
-                logging.debug('[*] 该消息已储存到文件: %s' % (fn))
-
             msgType = msg['MsgType']
-            name = self.getUserRemarkName(msg['FromUserName'])
+            name = self.getUserRemarkName(msg['FromUserName']) # 群名称,或者发消息人(可能是自己)
             content = msg['Content'].replace('&lt;', '<').replace('&gt;', '>')
             msgid = msg['MsgId']
 
             if msgType == 1:
                 raw_msg = {'raw_msg': msg}
+                if re.search(":<br/>", content, re.I):
+                    # 群里的消息
+                    [people, content] = content.split(':<br/>') # people是指群里谁发的
+                hm.old_msg[msgid] = content[:50]
                 self._showMsg(raw_msg)
-                if self.autoReplyMode:
-                    ans = self._xiaodoubi(content) + '\n[微信机器人自动回复]'
-                    if self.webwxsendmsg(ans, msg['FromUserName']):
-                        print '自动回复: ' + ans
-                        logging.info('自动回复: ' + ans)
-                    else:
-                        print '自动回复失败'
-                        logging.info('自动回复失败')
+
+                if content.startswith(hm.prefix):
+                    # 命令前缀
+                    res = hm.magic(content.lstrip(hm.prefix))
+                    if res:
+                        if msg['FromUserName'][:2] == '@@':
+                            # 接收到来自群的消息
+                            self.sendMsg(self.getUserRemarkName(msg['FromUserName']), res)
+                        elif msg['ToUserName'][:2] == '@@':
+                            # 自己发到群里的消息
+                            self.sendMsg(self.getUserRemarkName(msg['ToUserName']), res)
+                        else:
+                            # 发给消息发出者(可能是自己发给自己)
+                            self.sendMsg(name, res)
             elif msgType == 3:
                 image = self.webwxgetmsgimg(msgid)
                 raw_msg = {'raw_msg': msg,
@@ -773,7 +777,19 @@ class WebWeixin(object):
                 self._safe_open(video)
             elif msgType == 10002:
                 raw_msg = {'raw_msg': msg, 'message': '%s 撤回了一条消息' % name}
+                if msg['FromUserName'][:2] == '@@':
+                    # 接收到来自群的消息
+                    if re.search(":<br/>", content, re.I):
+                        [people, content] = content.split(':<br/>') # people是指群里谁发的
+                        msgid = re.findall("<msgid>(\d+)</msgid>", content)[0]
+                        if msgid in hm.old_msg:
+                            raw_msg['message'] = '%s 撤回了一条消息\n撤回的内容是: %s' % (self.getUserRemarkName(people), hm.old_msg[msgid])
+                else:
+                    msgid = re.findall("<msgid>(\d+)</msgid>", content)[0]
+                    if msgid in hm.old_msg:
+                        raw_msg['message'] = '%s 撤回了一条消息\n撤回的内容是: %s' % (name, hm.old_msg[msgid])
                 self._showMsg(raw_msg)
+                self.sendMsg(name, raw_msg['message'])
             else:
                 logging.debug('[*] 该消息类型为: %d，可能是表情，图片, 链接或红包: %s' %
                               (msg['MsgType'], json.dumps(msg)))
@@ -1019,25 +1035,6 @@ class WebWeixin(object):
             return json.loads(data, object_hook=_decode_dict)
         return data
 
-    def _xiaodoubi(self, word):
-        url = 'http://www.xiaodoubi.com/bot/chat.php'
-        try:
-            r = requests.post(url, data={'chat': word})
-            return r.content
-        except:
-            return "让我一个人静静 T_T..."
-
-    def _simsimi(self, word):
-        key = ''
-        url = 'http://sandbox.api.simsimi.com/request.p?key=%s&lc=ch&ft=0.0&text=%s' % (
-            key, word)
-        r = requests.get(url)
-        ans = r.json()
-        if ans['result'] == '100':
-            return ans['response']
-        else:
-            return '你在说什么，风太大听不清列'
-
     def _searchContent(self, key, content, fmat='attr'):
         if fmat == 'attr':
             pm = re.search(key + '\s?=\s?"([^"<]+)"', content)
@@ -1079,6 +1076,6 @@ if __name__ == '__main__':
     logger = logging.getLogger(__name__)
     import coloredlogs
     coloredlogs.install(level='DEBUG')
-
+    # coloredlogs.install(level='INFO')
     webwx = WebWeixin()
     webwx.start()
